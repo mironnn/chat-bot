@@ -12,8 +12,8 @@ from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import Runnable
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langserve import add_routes
-from langserve.pydantic_v1 import BaseModel, Field  # type: ignore
+from langserve import add_routes  # type: ignore
+from langserve.pydantic_v1 import BaseModel  # type: ignore
 from loguru import logger  # type: ignore
 
 load_dotenv()
@@ -21,7 +21,10 @@ load_dotenv()
 logger.remove(0)
 logger.add(sys.stdout, level="DEBUG", serialize=False)
 
-model = ChatOllama(model="llama2:70b-chat", num_ctx=4096)
+model = ChatOllama(
+    # model="llama2:70b-chat", num_ctx=4096, base_url="http://localhost:17434"
+    model="llama2:70b-chat-q4_1", num_ctx=4096, base_url="http://ollama_local:11434"
+)
 
 
 def _is_valid_identifier(value: str) -> bool:
@@ -52,26 +55,6 @@ def create_session_factory(
     return get_chat_history
 
 
-class SearchInput(BaseModel):
-    human_input: str = Field(description="should be a search query")
-
-
-# @tool("check-account-status", args_schema=SearchInput)
-# async def check_account_status(human_input: str) -> str:
-#     """
-#     Lookup the account status for a user.
-
-#     If True it is active, if False it is not active.
-#     """
-#     logger.info(f"checking account status for user_uuid: {human_input}")
-#     if human_input == "123":
-#         return "True"
-#     return ["foo"]
-
-
-# model_with_tool = model.bind(functions={"check_account_status": check_account_status})
-
-
 app = FastAPI(
     title="LangChain Server",
     version="1.0",
@@ -79,7 +62,6 @@ app = FastAPI(
 )
 
 
-# Declare a chain
 prompt: ChatPromptTemplate = ChatPromptTemplate.from_messages(
     [
         (
@@ -90,19 +72,9 @@ prompt: ChatPromptTemplate = ChatPromptTemplate.from_messages(
         ),
         MessagesPlaceholder(variable_name="history"),
         ("human", "{human_input}"),
-        # MessagesPlaceholder(variable_name="agent_scratchpad"),
     ]
 )
 
-agent: Runnable = (
-    {
-        "human_input": lambda x: x["human_input"],
-        # "agent_scratchpad": check_account_status,
-    }
-    | prompt
-    | model
-)
-# agent_executor = Agent(agent=agent, tools=[check_account_status], verbose=True)
 
 chain: Runnable = prompt | model
 
@@ -113,12 +85,9 @@ class InputChat(BaseModel):
     human_input: str
 
 
-# demo_ephemeral_chat_history = ChatMessageHistory()
-
 chain_with_history = RunnableWithMessageHistory(
     chain,
     create_session_factory(".chat_histories"),
-    # lambda session_id: demo_ephemeral_chat_history,
     input_messages_key="human_input",
     history_messages_key="history",
 ).with_types(input_type=InputChat)
