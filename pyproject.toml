@@ -21,6 +21,8 @@
     ipykernel = "^6.29.3"
     requests = "^2.31.0"
     python-dotenv = "^1.0.1"
+numexpr = "^2.9.0"
+langchainhub = "^0.1.14"
 
 [tool.poetry.group.dev.dependencies]
     mypy = "^1.8.0"

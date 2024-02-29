@@ -1,18 +1,19 @@
 """main."""
 import re
 import sys
-from pathlib import Path
-from typing import Callable, Union
+from typing import List
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from langchain.memory import FileChatMessageHistory
+from langchain import hub
+from langchain.agents import AgentExecutor, BaseSingleActionAgent, load_tools
+from langchain.agents.format_scratchpad import format_log_to_str
+from langchain.agents.output_parsers import (
+    ReActJsonSingleInputOutputParser,
+)
+from langchain.tools import StructuredTool, tool
+from langchain.tools.render import render_text_description
 from langchain_community.chat_models.ollama import ChatOllama
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import Runnable
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langserve import add_routes
+from langchain_core.tools import BaseTool
 from langserve.pydantic_v1 import BaseModel, Field  # type: ignore
 from loguru import logger  # type: ignore
 
@@ -21,115 +22,118 @@ load_dotenv()
 logger.remove(0)
 logger.add(sys.stdout, level="DEBUG", serialize=False)
 
-model = ChatOllama(model="llama2:70b-chat", num_ctx=4096)
+# model = ChatOllama(model="llama2:70b-chat-q4_1", num_ctx=4096)
+model = ChatOllama(model="mistral:7b-instruct-v0.2-fp16", num_ctx=4096)
 
 
-def _is_valid_identifier(value: str) -> bool:
-    """Check if the session ID is in a valid format."""
-    valid_characters = re.compile(r"^[a-zA-Z0-9-_]+$")
-    return bool(valid_characters.match(value))
+class AccountNumberModel(BaseModel):
+    """Model for account number."""
+
+    account_number: str = Field(description="customer account number")
 
 
-def create_session_factory(
-    base_dir: Union[str, Path],
-) -> Callable[[str], BaseChatMessageHistory]:
-    base_dir_ = Path(base_dir) if isinstance(base_dir, str) else base_dir
-    if not base_dir_.exists():
-        base_dir_.mkdir(parents=True)
+class SendEmailModel(BaseModel):
+    """Model for account email address and email content."""
 
-    def get_chat_history(session_id: str) -> FileChatMessageHistory:
-        """Get a chat history from a session ID."""
-        if not _is_valid_identifier(session_id):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Session ID `{session_id}` is not in a valid format. "
-                "Session ID must only contain alphanumeric characters, "
-                "hyphens, and underscores.",
-            )
-        file_path = base_dir_ / f"{session_id}.json"
-        return FileChatMessageHistory(str(file_path))
-
-    return get_chat_history
+    account_email: str = Field(description="customer email address")
+    content: str = Field(description="content of the email body")
 
 
-class SearchInput(BaseModel):
-    human_input: str = Field(description="should be a search query")
+def validate_email_address(email) -> bool:
+    """Perform some basic email address validation."""
+    pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+
+    # Check if the email matches the pattern
+    if re.match(pattern, email):
+        return True
+    return False
 
 
-# @tool("check-account-status", args_schema=SearchInput)
-# async def check_account_status(human_input: str) -> str:
-#     """
-#     Lookup the account status for a user.
-
-#     If True it is active, if False it is not active.
-#     """
-#     logger.info(f"checking account status for user_uuid: {human_input}")
-#     if human_input == "123":
-#         return "True"
-#     return ["foo"]
+@tool("check-account-status", args_schema=AccountNumberModel, return_direct=False)
+def check_account_status(account_number: str) -> str:
+    """Lookup the account status for a user: `active` or `not active` will be returned."""
+    logger.info(f"checking account status for account_number: {account_number}")
+    if account_number in ["123", "456"]:
+        return "active"
+    return "not active"
 
 
-# model_with_tool = model.bind(functions={"check_account_status": check_account_status})
+@tool("check-account-credit", args_schema=AccountNumberModel, return_direct=False)
+def check_account_credit(account_number: str) -> str:
+    """Lookup the account credit for a user: Amount of money will be retuned."""
+    logger.info(f"checking account status for account_number: {account_number}")
+    if account_number == "123":
+        return "$1000"
+    elif account_number == "456":
+        return "$2000"
+    return "unknown"
 
 
-app = FastAPI(
-    title="LangChain Server",
-    version="1.0",
-    description="Spin up a simple api server using Langchain's Runnable interfaces",
+# @tool("send-email", args_schema=SendEmailModel, return_direct=False)
+# def send_email(account_email: str, content: str) -> str:
+#     """Send email to the provided email address. Result will be provided as return value."""
+#     if validate_email_address(account_email):
+#         return "email was sent successfully"
+#     return "email address not valid"
+
+
+tools: List[BaseTool | StructuredTool] = load_tools(["llm-math"], llm=model)
+# tools.extend([check_account_status, check_account_credit, send_email])
+tools.extend([check_account_status, check_account_credit])  # type: ignore
+
+# setup ReAct style prompt
+prompt = hub.pull("hwchase17/react-json")
+# import pdb; pdb.set_trace()
+# addition_to_template = "Try to specify if some actions were successfull."
+# prompt.messages[0].prompt.template = prompt.messages[0].prompt.template + addition_to_template
+# logger.info(f"Promt: {prompt}")
+prompt = prompt.partial(
+    tools=render_text_description(tools),
+    tool_names=", ".join([t.name for t in tools]),
 )
 
-
-# Declare a chain
-prompt: ChatPromptTemplate = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are an respectful and honest assistant. You have to answer the user's "
-            "questions using only the context provided to you. If you don't know the answer, "
-            "just say you don't know. Don't try to make up an answer.",
-        ),
-        MessagesPlaceholder(variable_name="history"),
-        ("human", "{human_input}"),
-        # MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ]
-)
-
-agent: Runnable = (
+model_with_stop = model.bind(stop=["\nObservation"])
+agent: BaseSingleActionAgent = (
     {
-        "human_input": lambda x: x["human_input"],
-        # "agent_scratchpad": check_account_status,
+        "input": lambda x: x["input"],
+        "agent_scratchpad": lambda x: format_log_to_str(x["intermediate_steps"]),
     }
     | prompt
-    | model
-)
-# agent_executor = Agent(agent=agent, tools=[check_account_status], verbose=True)
-
-chain: Runnable = prompt | model
-
-
-class InputChat(BaseModel):
-    """Input for the chat endpoint."""
-
-    human_input: str
-
-
-# demo_ephemeral_chat_history = ChatMessageHistory()
-
-chain_with_history = RunnableWithMessageHistory(
-    chain,
-    create_session_factory(".chat_histories"),
-    # lambda session_id: demo_ephemeral_chat_history,
-    input_messages_key="human_input",
-    history_messages_key="history",
-).with_types(input_type=InputChat)
-
-
-add_routes(
-    app,
-    chain_with_history,
+    | model_with_stop
+    | ReActJsonSingleInputOutputParser()
 )
 
-if __name__ == "__main__":
-    import uvicorn
+def error_handler(error) -> str:
+    """Handle parsing errors."""
+    logger.error(f"Error: {error}")
+    return "Sorry, I couldn't understand that."
 
-    uvicorn.run(app, host="0.0.0.0", port=18000)
+agent_executor = AgentExecutor(
+    agent=agent, tools=tools, verbose=True,
+    handle_parsing_errors=error_handler,
+)
+
+for i in [
+    "hello, how are you?",
+    # "could you please help me?",
+
+    # # True
+    # "I'm user with account number 123. Can you check my account status?",
+    # "I'm user with account number 456. Does my account active?",
+    # # False
+    # "I'm user with account number 100500. Does my account work correctly?",
+    # "I'm user with account number 77. Is my account deactivated?",
+    # # 1000
+    # "I'm user with account number 123. Can you please advice my account credit?",
+    # # 2000
+    # "I'm user with account number 456. Can you please advice my account credit?",
+    # # Unknown
+    # "I'm user with account number 888. Can you please advice my account credit?",
+    # "I'm user with account number foo-bar-123. Can you please advice my account credit?",
+    # # Strong
+    # "I'm user with account number 123. Can you please advice my account status and credit?",
+
+    # "Send please email to test@foo.com",
+    # "I'm user with account number 123. Can you check my account credit? Could please result to my email with address foobar.com. Thanks",
+]:
+    agent_executor.invoke({"input": i})
